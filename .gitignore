@@ -1,0 +1,22 @@
+# Local secrets and persisted board data
+.env
+.env.*
+!.env.example
+/data/
+*.lock
+
+# Build outputs, coverage, and release archives
+/bin/
+/dist/
+/featherkan
+*.test
+coverage.out
+coverage.html
+*.tar.gz
+*.zip
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*.swp

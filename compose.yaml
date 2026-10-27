@@ -1,0 +1,16 @@
+services:
+  featherkan:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      BOARD_TOKEN: ${BOARD_TOKEN:?Set BOARD_TOKEN in .env or your shell}
+    command: ["-listen", "0.0.0.0:8080", "-data", "/data", "-mcp"]
+    volumes:
+      - board-data:/data
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+volumes:
+  board-data:
