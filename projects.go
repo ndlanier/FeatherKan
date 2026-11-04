@@ -175,10 +175,16 @@ func (s *Store) claimNext(tasks []Task, in Input) (any, error) {
 		return nil, nil
 	}
 	idx := -1
+	var oldest time.Time
 	for i, t := range tasks {
 		if t.ProjectID == in.ProjectID && t.QueueID == queue.ID && t.Status == "backlog" && (t.Assignee == "" || t.Assignee == in.Actor) {
-			if idx < 0 || t.EnqueuedAt < tasks[idx].EnqueuedAt || (t.EnqueuedAt == tasks[idx].EnqueuedAt && t.ID < tasks[idx].ID) {
+			enqueued, err := time.Parse(time.RFC3339Nano, t.EnqueuedAt)
+			if err != nil {
+				return nil, fmt.Errorf("invalid enqueue timestamp for task %s: %w", t.ID, err)
+			}
+			if idx < 0 || enqueued.Before(oldest) || (enqueued.Equal(oldest) && t.ID < tasks[idx].ID) {
 				idx = i
+				oldest = enqueued
 			}
 		}
 	}

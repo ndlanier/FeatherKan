@@ -251,3 +251,19 @@ func TestAdminAuthenticationRESTAndMCP(t *testing.T) {
 		}
 	}
 }
+
+func TestQueueFIFOWithVariableTimestampPrecision(t *testing.T) {
+	s := testStore(t)
+	q := queue(t, s, "default", 1)
+	first := queued(t, s, "default", q.ID)
+	queued(t, s, "default", q.ID)
+	s.tasks[0].EnqueuedAt = "2026-11-04T12:00:00.1Z"
+	s.tasks[1].EnqueuedAt = "2026-11-04T12:00:00.11Z"
+	v, err := s.run("claim_next", Input{QueueID: ptr(q.ID), Actor: "worker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.(Task).ID != first.ID {
+		t.Fatal("FIFO used timestamp text instead of chronological order")
+	}
+}
