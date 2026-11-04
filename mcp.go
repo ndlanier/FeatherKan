@@ -9,6 +9,10 @@ import (
 func toolList() []map[string]any {
 	str := func(desc string) map[string]any { return map[string]any{"type": "string", "description": desc} }
 	properties := map[string]any{"id": str("Task ID"), "actor": str("Your stable agent name; use the same name for claims, updates and handoffs"), "revision": map[string]any{"type": "integer", "description": "Latest task revision from get_task; required for claims, updates and release"}, "title": str("Task title, max 200 characters"), "description": str("Scope, affected files, acceptance criteria, decisions and handoff context"), "assignee": str("Agent name; empty string means unassigned"), "status": map[string]any{"type": "string", "enum": []string{"backlog", "in_progress", "blocked", "done"}}, "text": str("Comment or handoff note, max 10000 characters"), "query": str("Search task fields, comments and history")}
+	properties["projectId"] = str("Project ID; defaults to default for legacy clients. Every task operation is scoped to it.")
+	properties["queueId"] = str("Queue ID within the selected project; empty string clears routing on update")
+	properties["name"] = str("Project or queue name")
+	properties["maxInFlight"] = map[string]any{"type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum active tasks in this queue, default 1"}
 	defs := []struct {
 		name, description string
 		fields, required  []string
@@ -21,13 +25,41 @@ func toolList() []map[string]any {
 		{"add_comment", "Append progress, decisions, blockers, touched files or handoff context. Comments from other agents are welcome.", []string{"id", "actor", "text"}, []string{"id", "actor", "text"}},
 		{"release_task", "Release your claimed task back to backlog. Leave a handoff comment first. Claims do not expire automatically.", []string{"id", "revision", "actor"}, []string{"id", "revision", "actor"}},
 	}
+	defs = append(defs,
+		struct {
+			name, description string
+			fields, required  []string
+		}{"list_projects", "Discover project boards.", []string{}, []string{}},
+		struct {
+			name, description string
+			fields, required  []string
+		}{"create_project", "Create a project board. Requires the separate administrator token.", []string{"name", "description"}, []string{"name"}},
+		struct {
+			name, description string
+			fields, required  []string
+		}{"list_queues", "Discover supervisor queues for this project.", []string{"projectId"}, []string{}},
+		struct {
+			name, description string
+			fields, required  []string
+		}{"create_queue", "Create a custom supervisor queue. Requires administrator token. Default concurrency is one.", []string{"projectId", "name", "description", "maxInFlight"}, []string{"name"}},
+		struct {
+			name, description string
+			fields, required  []string
+		}{"claim_next", "Atomically claim oldest eligible backlog item in a queue. Returns null when empty or at capacity. Repeating with the same actor returns its active item. Poll with backoff. Claims do not expire; inspect external effects before resuming interrupted work.", []string{"projectId", "queueId", "actor"}, []string{"queueId", "actor"}},
+	)
 	out := []map[string]any{}
 	for _, d := range defs {
+		if d.name == "list_tasks" || d.name == "create_task" || d.name == "update_task" {
+			d.fields = append(d.fields, "queueId")
+		}
+		if d.name == "list_tasks" || d.name == "get_task" || d.name == "create_task" || d.name == "update_task" || d.name == "claim_task" || d.name == "release_task" || d.name == "add_comment" {
+			d.fields = append(d.fields, "projectId")
+		}
 		p := map[string]any{}
 		for _, k := range d.fields {
 			p[k] = properties[k]
 		}
-		out = append(out, map[string]any{"name": d.name, "description": d.description, "inputSchema": map[string]any{"type": "object", "properties": p, "required": d.required, "additionalProperties": false}, "annotations": map[string]any{"readOnlyHint": d.name == "list_tasks" || d.name == "get_task", "destructiveHint": false, "openWorldHint": false}})
+		out = append(out, map[string]any{"name": d.name, "description": d.description, "inputSchema": map[string]any{"type": "object", "properties": p, "required": d.required, "additionalProperties": false}, "annotations": map[string]any{"readOnlyHint": strings.HasPrefix(d.name, "list_") || d.name == "get_task", "destructiveHint": false, "openWorldHint": false}})
 	}
 	return out
 }
@@ -88,7 +120,7 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		if !supported(v) {
 			v = "2025-11-25"
 		}
-		result = map[string]any{"protocolVersion": v, "capabilities": map[string]any{"tools": map[string]any{}}, "serverInfo": map[string]any{"name": "featherkan", "version": "1.0.0"}, "instructions": "Read the board before starting. Use a stable actor name. Claim a task before work and stop if claiming fails. Record affected files and handoffs in comments. Re-read after revision conflicts. Completed tasks remain searchable memory. Ownership is cooperative, not an identity security boundary."}
+		result = map[string]any{"protocolVersion": v, "capabilities": map[string]any{"tools": map[string]any{}}, "serverInfo": map[string]any{"name": "featherkan", "version": "1.1.0"}, "instructions": "Discover projects and queues first. Include projectId on every task operation. Supervisors can poll claim_next for a queue. Admin credentials permit owner overrides but do not bypass revision checks. Read the board before starting. Use a stable actor name. Claim a task before work and stop if claiming fails. Record affected files and handoffs in comments. Re-read after revision conflicts. Completed tasks remain searchable memory. Ownership is cooperative, not an identity security boundary."}
 	case "ping":
 		result = map[string]any{}
 	case "tools/list":
@@ -123,7 +155,7 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 			rpcError(req.ID, -32602, "Invalid tool arguments")
 			return
 		}
-		value, err := s.store.run(p.Name, in)
+		value, err := s.store.runAs(p.Name, in, isAdmin(r))
 		isError := err != nil
 		var text string
 		if err != nil {
