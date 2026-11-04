@@ -143,11 +143,11 @@ func TestConcurrentCommentsPersist(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	var saved []Task
+	var saved State
 	if e = json.Unmarshal(b, &saved); e != nil {
 		t.Fatal(e)
 	}
-	if len(saved[0].Comments) != 20 || saved[0].Revision != 21 {
+	if len(saved.Tasks[0].Comments) != 20 || saved.Tasks[0].Revision != 21 {
 		t.Fatal("lost concurrent comment")
 	}
 }

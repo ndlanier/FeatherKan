@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,9 @@ type Entry struct {
 	At     string `json:"at"`
 }
 type Task struct {
+	ProjectID   string  `json:"projectId"`
+	QueueID     string  `json:"queueId"`
+	EnqueuedAt  string  `json:"enqueuedAt,omitempty"`
 	ID          string  `json:"id"`
 	Title       string  `json:"title"`
 	Assignee    string  `json:"assignee"`
@@ -31,6 +35,10 @@ type Task struct {
 	History     []Entry `json:"history"`
 }
 type Input struct {
+	ProjectID   string  `json:"projectId,omitempty"`
+	QueueID     *string `json:"queueId,omitempty"`
+	Name        string  `json:"name,omitempty"`
+	MaxInFlight int     `json:"maxInFlight,omitempty"`
 	ID          string  `json:"id"`
 	Title       *string `json:"title,omitempty"`
 	Description *string `json:"description,omitempty"`
@@ -50,10 +58,12 @@ func (e *apiError) Error() string     { return e.Message }
 func fail(code int, msg string) error { return &apiError{code, msg} }
 
 type Store struct {
-	mu    sync.Mutex
-	path  string
-	tasks []Task
-	lock  *os.File
+	mu       sync.Mutex
+	path     string
+	tasks    []Task
+	projects []Project
+	queues   []Queue
+	lock     *os.File
 }
 
 func openStore(dir string) (*Store, error) {
@@ -68,10 +78,44 @@ func openStore(dir string) (*Store, error) {
 		f.Close()
 		return nil, fmt.Errorf("data directory is already in use: %w", err)
 	}
-	s := &Store{path: filepath.Join(dir, "board.json"), tasks: []Task{}, lock: f}
+	s := &Store{path: filepath.Join(dir, "board.json"), tasks: []Task{}, projects: []Project{{ID: "default", Name: "Default", Description: "Existing and general work"}}, queues: []Queue{}, lock: f}
 	b, err := os.ReadFile(s.path)
 	if err == nil {
-		err = json.Unmarshal(b, &s.tasks)
+		if bytes.HasPrefix(bytes.TrimSpace(b), []byte("[")) {
+			err = json.Unmarshal(b, &s.tasks)
+			if err == nil {
+				for i := range s.tasks {
+					s.tasks[i].ProjectID = "default"
+				}
+				// Preserve the original bytes before the first v2 write. Never overwrite a prior backup.
+				backup, e := os.OpenFile(s.path+".v1.bak", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+				if e == nil {
+					_, e = backup.Write(b)
+					if e == nil {
+						e = backup.Sync()
+					}
+					closeErr := backup.Close()
+					if e == nil {
+						e = closeErr
+					}
+				} else if errors.Is(e, os.ErrExist) {
+					e = nil
+				}
+				err = e
+			}
+		} else {
+			var state State
+			err = json.Unmarshal(b, &state)
+			if err == nil && state.Version != 2 {
+				err = errors.New("unsupported board schema version")
+			}
+			if err == nil {
+				s.tasks = state.Tasks
+				s.projects = state.Projects
+				s.queues = state.Queues
+				err = s.validateState()
+			}
+		}
 	}
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		s.close()
@@ -89,8 +133,9 @@ func clone(tasks []Task) []Task {
 	json.Unmarshal(b, &out)
 	return out
 }
-func (s *Store) save(tasks []Task) error {
-	b, err := json.MarshalIndent(tasks, "", "  ")
+func (s *Store) save(tasks []Task) error { return s.saveState(tasks, s.projects, s.queues) }
+func (s *Store) saveState(tasks []Task, projects []Project, queues []Queue) error {
+	b, err := json.MarshalIndent(State{Version: 2, Tasks: tasks, Projects: projects, Queues: queues}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -118,21 +163,54 @@ func (s *Store) save(tasks []Task) error {
 		d.Close()
 	}
 	s.tasks = tasks
+	s.projects = projects
+	s.queues = queues
 	return nil
 }
 func validStatus(s string) bool {
 	return s == "backlog" || s == "in_progress" || s == "blocked" || s == "done"
 }
-func (s *Store) run(action string, in Input) (any, error) {
+func (s *Store) run(action string, in Input) (any, error) { return s.runAs(action, in, false) }
+func (s *Store) runAs(action string, in Input, admin bool) (any, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tasks := clone(s.tasks)
+	if in.ProjectID == "" {
+		in.ProjectID = "default"
+	}
+	if action == "list_projects" {
+		return append([]Project{}, s.projects...), nil
+	}
+	if action == "create_project" {
+		return s.createProject(in, admin)
+	}
+	if !s.hasProject(in.ProjectID) {
+		return nil, fail(404, "Project not found")
+	}
+	if action == "list_queues" {
+		out := []Queue{}
+		for _, q := range s.queues {
+			if q.ProjectID == in.ProjectID {
+				out = append(out, q)
+			}
+		}
+		return out, nil
+	}
+	if action == "create_queue" {
+		return s.createQueue(in, admin)
+	}
+	if in.QueueID != nil && *in.QueueID != "" && s.findQueue(in.ProjectID, *in.QueueID) == nil {
+		return nil, fail(404, "Queue not found in this project")
+	}
+	if action == "claim_next" {
+		return s.claimNext(tasks, in)
+	}
 	if action == "list_tasks" {
 		out := []Task{}
 		q := strings.ToLower(in.Query)
 		for _, t := range tasks {
 			b, _ := json.Marshal(t)
-			if (in.Status == nil || t.Status == *in.Status) && (in.Assignee == nil || t.Assignee == *in.Assignee) && strings.Contains(strings.ToLower(string(b)), q) {
+			if t.ProjectID == in.ProjectID && (in.QueueID == nil || t.QueueID == *in.QueueID) && (in.Status == nil || t.Status == *in.Status) && (in.Assignee == nil || t.Assignee == *in.Assignee) && strings.Contains(strings.ToLower(string(b)), q) {
 				out = append(out, t)
 			}
 		}
@@ -140,7 +218,7 @@ func (s *Store) run(action string, in Input) (any, error) {
 	}
 	idx := -1
 	for i := range tasks {
-		if tasks[i].ID == in.ID {
+		if tasks[i].ID == in.ID && tasks[i].ProjectID == in.ProjectID {
 			idx = i
 			break
 		}
@@ -160,7 +238,7 @@ func (s *Store) run(action string, in Input) (any, error) {
 		if in.Title == nil || strings.TrimSpace(*in.Title) == "" || len(*in.Title) > 200 {
 			return nil, fail(400, "title is required (maximum 200 characters)")
 		}
-		t := Task{ID: fmt.Sprintf("%x", randomBytes()), Title: strings.TrimSpace(*in.Title), Status: "backlog", Revision: 1, CreatedAt: now, UpdatedAt: now, Comments: []Entry{}, History: []Entry{{in.Actor, "Created task", now}}}
+		t := Task{ProjectID: in.ProjectID, ID: fmt.Sprintf("%x", randomBytes()), Title: strings.TrimSpace(*in.Title), Status: "backlog", Revision: 1, CreatedAt: now, UpdatedAt: now, Comments: []Entry{}, History: []Entry{{in.Actor, "Created task", now}}}
 		if in.Description != nil {
 			t.Description = *in.Description
 		}
@@ -181,6 +259,17 @@ func (s *Store) run(action string, in Input) (any, error) {
 		}
 		if t.Status == "in_progress" && t.Assignee == "" {
 			return nil, fail(400, "Assign an owner before starting work")
+		}
+		if in.QueueID != nil {
+			t.QueueID = *in.QueueID
+			if t.QueueID != "" {
+				t.EnqueuedAt = now
+			}
+		}
+		if t.Status == "in_progress" {
+			if err := s.queueCapacity(tasks, t); err != nil {
+				return nil, err
+			}
 		}
 		tasks = append(tasks, t)
 		if err := s.save(tasks); err != nil {
@@ -204,27 +293,42 @@ func (s *Store) run(action string, in Input) (any, error) {
 		}
 		switch action {
 		case "claim_task":
-			if t.Assignee != "" && t.Assignee != in.Actor {
+			if !admin && t.Assignee != "" && t.Assignee != in.Actor {
 				return nil, fail(409, "Task is already assigned to "+t.Assignee)
 			}
 			if t.Status == "done" {
 				return nil, fail(409, "Reopen this task before claiming it")
 			}
+			if err := s.queueCapacity(tasks, *t); err != nil {
+				return nil, err
+			}
 			t.Assignee = in.Actor
 			t.Status = "in_progress"
 			t.History = append(t.History, Entry{in.Actor, "Claimed task and started work", now})
 		case "release_task":
-			if t.Assignee != in.Actor {
+			if !admin && t.Assignee != in.Actor {
 				return nil, fail(409, "Only the current assignee can release this task")
+			}
+			if t.QueueID != "" {
+				t.EnqueuedAt = now
 			}
 			t.Assignee = ""
 			t.Status = "backlog"
 			t.History = append(t.History, Entry{in.Actor, "Released task to backlog", now})
 		case "update_task":
-			if t.Assignee != "" && t.Assignee != in.Actor {
+			if !admin && t.Assignee != "" && t.Assignee != in.Actor {
 				return nil, fail(409, "Task belongs to "+t.Assignee+". Coordinate with its owner before editing.")
 			}
 			before := *t
+			if in.QueueID != nil {
+				t.QueueID = *in.QueueID
+				if t.QueueID != before.QueueID {
+					t.EnqueuedAt = ""
+					if t.QueueID != "" {
+						t.EnqueuedAt = now
+					}
+				}
+			}
 			if in.Title != nil {
 				t.Title = strings.TrimSpace(*in.Title)
 			}
@@ -243,7 +347,21 @@ func (s *Store) run(action string, in Input) (any, error) {
 			if t.Status == "in_progress" && t.Assignee == "" {
 				return nil, fail(400, "Assign an owner before starting work")
 			}
+			if before.QueueID != t.QueueID && before.Status == "in_progress" && t.Status == "in_progress" {
+				return nil, fail(409, "Stop or complete active work before moving it to another queue")
+			}
+			if t.Status == "in_progress" {
+				if err := s.queueCapacity(tasks, *t); err != nil {
+					return nil, err
+				}
+			}
+			if before.Status != "backlog" && t.Status == "backlog" && t.QueueID != "" {
+				t.EnqueuedAt = now
+			}
 			changes := []string{}
+			if before.QueueID != t.QueueID {
+				changes = append(changes, "queue: "+before.QueueID+" → "+t.QueueID)
+			}
 			if before.Title != t.Title {
 				changes = append(changes, "title updated")
 			}
@@ -263,6 +381,9 @@ func (s *Store) run(action string, in Input) (any, error) {
 		default:
 			return nil, fail(400, "Unknown operation")
 		}
+	}
+	if admin && action != "add_comment" {
+		t.History = append(t.History, Entry{in.Actor, "Administrator action: " + action, now})
 	}
 	t.Revision++
 	t.UpdatedAt = now

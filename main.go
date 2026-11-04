@@ -24,10 +24,18 @@ import (
 var assets embed.FS
 
 type Server struct {
-	store  *Store
-	token  string
-	mcp    bool
-	origin string
+	store      *Store
+	token      string
+	adminToken string
+	mcp        bool
+	origin     string
+}
+
+type adminContextKey struct{}
+
+func isAdmin(r *http.Request) bool { v, _ := r.Context().Value(adminContextKey{}).(bool); return v }
+func tokenMatches(header, token string) bool {
+	return token != "" && subtle.ConstantTimeCompare([]byte(header), []byte("Bearer "+token)) == 1
 }
 
 func jsonReply(w http.ResponseWriter, status int, v any) {
@@ -49,9 +57,11 @@ func decode(w http.ResponseWriter, r *http.Request, v any) error {
 }
 func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/config", func(w http.ResponseWriter, r *http.Request) { jsonReply(w, 200, map[string]any{"mcp": s.mcp}) })
+	mux.HandleFunc("GET /api/config", func(w http.ResponseWriter, r *http.Request) {
+		jsonReply(w, 200, map[string]any{"mcp": s.mcp, "admin": isAdmin(r), "adminConfigured": s.adminToken != ""})
+	})
 	mux.HandleFunc("GET /api/tasks", func(w http.ResponseWriter, r *http.Request) {
-		v, e := s.store.run("list_tasks", Input{Query: r.URL.Query().Get("q")})
+		v, e := s.store.run("list_tasks", Input{ProjectID: r.URL.Query().Get("projectId"), Query: r.URL.Query().Get("q"), QueueID: queryPointer(r, "queueId")})
 		s.respond(w, v, e)
 	})
 	mux.HandleFunc("POST /api/actions/{action}", func(w http.ResponseWriter, r *http.Request) {
@@ -60,7 +70,15 @@ func (s *Server) handler() http.Handler {
 			jsonReply(w, 400, map[string]string{"error": "Invalid request body"})
 			return
 		}
-		v, e := s.store.run(r.PathValue("action"), in)
+		v, e := s.store.runAs(r.PathValue("action"), in, isAdmin(r))
+		s.respond(w, v, e)
+	})
+	mux.HandleFunc("GET /api/projects", func(w http.ResponseWriter, r *http.Request) {
+		v, e := s.store.run("list_projects", Input{})
+		s.respond(w, v, e)
+	})
+	mux.HandleFunc("GET /api/queues", func(w http.ResponseWriter, r *http.Request) {
+		v, e := s.store.run("list_queues", Input{ProjectID: r.URL.Query().Get("projectId")})
 		s.respond(w, v, e)
 	})
 	mux.HandleFunc("/mcp", s.handleMCP)
@@ -91,7 +109,9 @@ func (s *Server) handler() http.Handler {
 			}
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/mcp" {
-			if s.token != "" && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+s.token)) != 1 {
+			admin := tokenMatches(r.Header.Get("Authorization"), s.adminToken)
+			r = r.WithContext(context.WithValue(r.Context(), adminContextKey{}, admin))
+			if s.token != "" && !admin && !tokenMatches(r.Header.Get("Authorization"), s.token) {
 				jsonReply(w, 401, map[string]string{"error": "Enter the board access token to connect."})
 				return
 			}
@@ -122,6 +142,10 @@ func main() {
 	origin := flag.String("origin", "", "Additional allowed browser origin, e.g. https://board.example.com")
 	flag.Parse()
 	token := os.Getenv("BOARD_TOKEN")
+	adminToken := os.Getenv("BOARD_ADMIN_TOKEN")
+	if adminToken != "" && adminToken == token {
+		log.Fatal("BOARD_ADMIN_TOKEN must differ from BOARD_TOKEN")
+	}
 	host, _, err := net.SplitHostPort(*addr)
 	if err != nil {
 		log.Fatal(err)
@@ -135,7 +159,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer store.close()
-	app := &Server{store: store, token: token, mcp: *mcp, origin: *origin}
+	app := &Server{store: store, token: token, adminToken: adminToken, mcp: *mcp, origin: *origin}
 	srv := &http.Server{Addr: *addr, Handler: app.handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -149,4 +173,12 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+}
+
+func queryPointer(r *http.Request, key string) *string {
+	if !r.URL.Query().Has(key) {
+		return nil
+	}
+	v := r.URL.Query().Get(key)
+	return &v
 }
