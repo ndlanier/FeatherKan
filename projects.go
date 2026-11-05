@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"strings"
-	"time"
 )
 
 type Project struct {
@@ -19,6 +18,7 @@ type Queue struct {
 	MaxInFlight int    `json:"maxInFlight"`
 }
 type State struct {
+	Requests []Request `json:"requests"`
 	Version  int       `json:"version"`
 	Projects []Project `json:"projects"`
 	Queues   []Queue   `json:"queues"`
@@ -128,78 +128,4 @@ func (s *Store) createQueue(in Input, admin bool) (any, error) {
 		return nil, err
 	}
 	return q, nil
-}
-func (s *Store) queueCapacity(tasks []Task, t Task) error {
-	if t.QueueID == "" {
-		return nil
-	}
-	q := s.findQueue(t.ProjectID, t.QueueID)
-	if q == nil {
-		return fail(404, "Queue not found")
-	}
-	active := 0
-	for _, other := range tasks {
-		if other.ID != t.ID && other.ProjectID == t.ProjectID && other.QueueID == t.QueueID && other.Status == "in_progress" {
-			active++
-		}
-	}
-	if active >= q.MaxInFlight {
-		return fail(409, "Queue is at its active-work limit")
-	}
-	return nil
-}
-
-// Called under Store.mu: selection and persistence are one atomic operation.
-func (s *Store) claimNext(tasks []Task, in Input) (any, error) {
-	in.Actor = strings.TrimSpace(in.Actor)
-	if in.Actor == "" || len(in.Actor) > 120 {
-		return nil, fail(400, "actor is required (120 bytes maximum)")
-	}
-	if in.QueueID == nil || *in.QueueID == "" {
-		return nil, fail(400, "queueId is required")
-	}
-	queue := s.findQueue(in.ProjectID, *in.QueueID)
-	if queue == nil {
-		return nil, fail(404, "Queue not found")
-	}
-	active := 0
-	for _, t := range tasks {
-		if t.ProjectID == in.ProjectID && t.QueueID == queue.ID && t.Status == "in_progress" {
-			if t.Assignee == in.Actor {
-				return t, nil
-			}
-			active++
-		}
-	}
-	if active >= queue.MaxInFlight {
-		return nil, nil
-	}
-	idx := -1
-	var oldest time.Time
-	for i, t := range tasks {
-		if t.ProjectID == in.ProjectID && t.QueueID == queue.ID && t.Status == "backlog" && (t.Assignee == "" || t.Assignee == in.Actor) {
-			enqueued, err := time.Parse(time.RFC3339Nano, t.EnqueuedAt)
-			if err != nil {
-				return nil, fmt.Errorf("invalid enqueue timestamp for task %s: %w", t.ID, err)
-			}
-			if idx < 0 || enqueued.Before(oldest) || (enqueued.Equal(oldest) && t.ID < tasks[idx].ID) {
-				idx = i
-				oldest = enqueued
-			}
-		}
-	}
-	if idx < 0 {
-		return nil, nil
-	}
-	t := &tasks[idx]
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	t.Status = "in_progress"
-	t.Assignee = in.Actor
-	t.Revision++
-	t.UpdatedAt = now
-	t.History = append(t.History, Entry{in.Actor, "Claimed next item from queue " + queue.Name, now})
-	if err := s.save(tasks); err != nil {
-		return nil, err
-	}
-	return *t, nil
 }

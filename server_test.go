@@ -62,7 +62,7 @@ func TestMCPWorkflow(t *testing.T) {
 		t.Fatal("notification not accepted")
 	}
 	v = call(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
-	if len(v["result"].(map[string]any)["tools"].([]any)) != 12 {
+	if len(v["result"].(map[string]any)["tools"].([]any)) != 18 {
 		t.Fatal("missing tools")
 	}
 	v = call(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_task","arguments":{"title":"MCP task","actor":"agent"}}}`)

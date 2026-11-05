@@ -64,6 +64,10 @@ func (s *Server) handler() http.Handler {
 		v, e := s.store.run("list_tasks", Input{ProjectID: r.URL.Query().Get("projectId"), Query: r.URL.Query().Get("q"), QueueID: queryPointer(r, "queueId")})
 		s.respond(w, v, e)
 	})
+	mux.HandleFunc("GET /api/requests", func(w http.ResponseWriter, r *http.Request) {
+		v, e := s.store.run("list_requests", Input{ProjectID: r.URL.Query().Get("projectId"), QueueID: queryPointer(r, "queueId"), Status: queryPointer(r, "status")})
+		s.respond(w, v, e)
+	})
 	mux.HandleFunc("POST /api/actions/{action}", func(w http.ResponseWriter, r *http.Request) {
 		var in Input
 		if decode(w, r, &in) != nil {

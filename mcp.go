@@ -8,11 +8,13 @@ import (
 
 func toolList() []map[string]any {
 	str := func(desc string) map[string]any { return map[string]any{"type": "string", "description": desc} }
-	properties := map[string]any{"id": str("Task ID"), "actor": str("Your stable agent name; use the same name for claims, updates and handoffs"), "revision": map[string]any{"type": "integer", "description": "Latest task revision from get_task; required for claims, updates and release"}, "title": str("Task title, max 200 characters"), "description": str("Scope, affected files, acceptance criteria, decisions and handoff context"), "assignee": str("Agent name; empty string means unassigned"), "status": map[string]any{"type": "string", "enum": []string{"backlog", "in_progress", "blocked", "done"}}, "text": str("Comment or handoff note, max 10000 characters"), "query": str("Search task fields, comments and history")}
+	properties := map[string]any{"id": str("Task or request ID, depending on operation"), "actor": str("Your stable agent name; use the same name for claims, updates and handoffs"), "revision": map[string]any{"type": "integer", "description": "Latest task revision from get_task; required for claims, updates and release"}, "title": str("Task title, max 200 characters"), "description": str("Scope, affected files, acceptance criteria, decisions and handoff context"), "assignee": str("Agent name; empty string means unassigned"), "status": map[string]any{"type": "string", "enum": []string{"backlog", "in_progress", "blocked", "done"}}, "text": str("Comment or handoff note, max 10000 characters"), "query": str("Search task fields, comments and history")}
 	properties["projectId"] = str("Project ID; defaults to default for legacy clients. Every task operation is scoped to it.")
-	properties["queueId"] = str("Queue ID within the selected project; empty string clears routing on update")
+	properties["queueId"] = str("Queue ID within the selected project; requests are separate from tickets")
 	properties["name"] = str("Project or queue name")
-	properties["maxInFlight"] = map[string]any{"type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum active tasks in this queue, default 1"}
+	properties["maxInFlight"] = map[string]any{"type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum active requests in this queue, default 1"}
+	properties["payload"] = map[string]any{"description": "Arbitrary JSON request data for the supervisor, max 30000 bytes"}
+	properties["result"] = map[string]any{"description": "Optional arbitrary JSON result, max 30000 bytes"}
 	defs := []struct {
 		name, description string
 		fields, required  []string
@@ -45,21 +47,34 @@ func toolList() []map[string]any {
 		struct {
 			name, description string
 			fields, required  []string
-		}{"claim_next", "Atomically claim oldest eligible backlog item in a queue. Returns null when empty or at capacity. Repeating with the same actor returns its active item. Poll with backoff. Claims do not expire; inspect external effects before resuming interrupted work.", []string{"projectId", "queueId", "actor"}, []string{"queueId", "actor"}},
+		}{"claim_next", "Atomically claim oldest pending request in a queue. Returns null when empty or at capacity. Repeating with the same actor returns its active request. Poll with backoff. Claims do not expire; inspect external effects before resuming interrupted work.", []string{"projectId", "queueId", "actor"}, []string{"queueId", "actor"}},
 	)
+	for _, d := range []struct {
+		name, description string
+		fields, required  []string
+	}{
+		{"enqueue_request", "Submit general JSON data to a supervisor queue. This creates no Kanban ticket.", []string{"projectId", "queueId", "actor", "payload"}, []string{"queueId", "actor", "payload"}},
+		{"list_requests", "List requests in a queue, optionally filtering status.", []string{"projectId", "queueId", "status"}, []string{"queueId"}},
+		{"get_request", "Read a request payload, result, history, and revision.", []string{"projectId", "queueId", "id"}, []string{"queueId", "id"}},
+		{"complete_request", "Complete your active request after verifying external results.", []string{"projectId", "queueId", "id", "actor", "revision", "result"}, []string{"queueId", "id", "actor", "revision"}},
+		{"fail_request", "Record a failure after stopping external work. Failed requests require explicit recovery.", []string{"projectId", "queueId", "id", "actor", "revision", "text", "result"}, []string{"queueId", "id", "actor", "revision", "text"}},
+		{"release_request", "Return an active or failed request to the queue tail. Owner or administrator only; verify external work stopped first.", []string{"projectId", "queueId", "id", "actor", "revision"}, []string{"queueId", "id", "actor", "revision"}},
+	} {
+		defs = append(defs, d)
+	}
 	out := []map[string]any{}
 	for _, d := range defs {
-		if d.name == "list_tasks" || d.name == "create_task" || d.name == "update_task" {
-			d.fields = append(d.fields, "queueId")
-		}
 		if d.name == "list_tasks" || d.name == "get_task" || d.name == "create_task" || d.name == "update_task" || d.name == "claim_task" || d.name == "release_task" || d.name == "add_comment" {
 			d.fields = append(d.fields, "projectId")
 		}
 		p := map[string]any{}
 		for _, k := range d.fields {
 			p[k] = properties[k]
+			if k == "status" && d.name == "list_requests" {
+				p[k] = map[string]any{"type": "string", "enum": []string{"pending", "active", "completed", "failed"}}
+			}
 		}
-		out = append(out, map[string]any{"name": d.name, "description": d.description, "inputSchema": map[string]any{"type": "object", "properties": p, "required": d.required, "additionalProperties": false}, "annotations": map[string]any{"readOnlyHint": strings.HasPrefix(d.name, "list_") || d.name == "get_task", "destructiveHint": false, "openWorldHint": false}})
+		out = append(out, map[string]any{"name": d.name, "description": d.description, "inputSchema": map[string]any{"type": "object", "properties": p, "required": d.required, "additionalProperties": false}, "annotations": map[string]any{"readOnlyHint": strings.HasPrefix(d.name, "list_") || d.name == "get_task" || d.name == "get_request", "destructiveHint": false, "openWorldHint": false}})
 	}
 	return out
 }
@@ -120,7 +135,7 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		if !supported(v) {
 			v = "2025-11-25"
 		}
-		result = map[string]any{"protocolVersion": v, "capabilities": map[string]any{"tools": map[string]any{}}, "serverInfo": map[string]any{"name": "featherkan", "version": "1.1.0"}, "instructions": "Discover projects and queues first. Include projectId on every task operation. Supervisors can poll claim_next for a queue. Admin credentials permit owner overrides but do not bypass revision checks. Read the board before starting. Use a stable actor name. Claim a task before work and stop if claiming fails. Record affected files and handoffs in comments. Re-read after revision conflicts. Completed tasks remain searchable memory. Ownership is cooperative, not an identity security boundary."}
+		result = map[string]any{"protocolVersion": v, "capabilities": map[string]any{"tools": map[string]any{}}, "serverInfo": map[string]any{"name": "featherkan", "version": "1.2.0"}, "instructions": "Discover projects and queues first. Include projectId on every task operation. Queue requests carry arbitrary JSON payloads and are independent of tickets. Use enqueue_request, claim_next, and complete_request/fail_request. Include projectId and queueId for every request operation. Admin credentials permit owner overrides but do not bypass revision checks. Read the board before starting. Use a stable actor name. Claim a task before work and stop if claiming fails. Record affected files and handoffs in comments. Re-read after revision conflicts. Completed tasks remain searchable memory. Ownership is cooperative, not an identity security boundary."}
 	case "ping":
 		result = map[string]any{}
 	case "tools/list":

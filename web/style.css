@@ -4,3 +4,5 @@
 .brand img{display:block;flex:none}.brand>span{white-space:nowrap}.brand .brand-kan{color:#668776;font-weight:450}.brand:hover img{transform:rotate(-7deg);transition:transform .2s ease}@media(prefers-reduced-motion:reduce){.brand:hover img{transform:none;transition:none}}
 
 .project-toolbar{display:flex;align-items:end;gap:12px;flex-wrap:wrap;margin-bottom:10px}.project-toolbar label{margin:0;min-width:200px}.project-toolbar button{margin-bottom:1px}.role-badge{font-size:10px;color:#466955;background:#e7efe8;padding:5px 8px;border-radius:20px;white-space:nowrap}.queue-tag{display:inline-block;margin-bottom:8px;font-size:10px;color:#53735e;background:#edf4ee;padding:3px 6px;border-radius:4px}#queue-help{min-height:20px}#create-dialog{max-width:480px}@media(max-width:560px){.project-toolbar label{width:100%}.role-badge{display:none}}
+
+#request-list{display:flex;flex-direction:column;gap:12px}.request-card{text-align:left;width:100%;padding:18px}.request-card pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow:auto;font-size:12px}#request-payload,#request-result{font-family:ui-monospace,monospace}
