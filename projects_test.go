@@ -25,20 +25,24 @@ func queue(t *testing.T, s *Store, p string, limit int) Queue {
 	}
 	return v.(Queue)
 }
-func queued(t *testing.T, s *Store, p, q string) Task {
+func queued(t *testing.T, s *Store, p, q string) Request {
 	t.Helper()
-	v, e := s.run("create_task", Input{ProjectID: p, QueueID: ptr(q), Title: ptr("Integrate reviewed PR"), Actor: "planner"})
+	v, e := s.run("enqueue_request", Input{ProjectID: p, QueueID: ptr(q), Payload: json.RawMessage(`{"type":"merge","prs":[17,18]}`), Actor: "planner"})
 	if e != nil {
 		t.Fatal(e)
 	}
-	return v.(Task)
+	return v.(Request)
 }
 func TestProjectScopeAndQueueReferences(t *testing.T) {
 	s := testStore(t)
 	a := project(t, s, "A")
 	b := project(t, s, "B")
 	q := queue(t, s, a.ID, 1)
-	task := queued(t, s, a.ID, q.ID)
+	v0, e0 := s.run("create_task", Input{ProjectID: a.ID, Title: ptr("Task"), Actor: "planner"})
+	if e0 != nil {
+		t.Fatal(e0)
+	}
+	task := v0.(Task)
 	for _, op := range []string{"get_task", "claim_task", "update_task", "release_task", "add_comment"} {
 		if _, e := s.runAs(op, Input{ProjectID: b.ID, ID: task.ID, Actor: "admin", Revision: 1, Text: "note"}, true); e == nil {
 			t.Fatalf("%s crossed project", op)
@@ -68,18 +72,18 @@ func TestConcurrentSupervisorClaimsAndRecovery(t *testing.T) {
 	second := queued(t, s, "default", q.ID)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	claimed := []Task{}
+	claimed := []Request{}
 	for i := 0; i < 20; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			v, e := s.run("claim_next", Input{QueueID: ptr(q.ID), Actor: fmt.Sprintf("worker-%d", i)})
+			v, e := s.run("claim_next", Input{QueueID: ptr(q.ID), Actor: fmt.Sprintf("w-%d", i)})
 			if e != nil {
 				t.Error(e)
 			}
 			if v != nil {
 				mu.Lock()
-				claimed = append(claimed, v.(Task))
+				claimed = append(claimed, v.(Request))
 				mu.Unlock()
 			}
 		}(i)
@@ -88,22 +92,25 @@ func TestConcurrentSupervisorClaimsAndRecovery(t *testing.T) {
 	if len(claimed) != 1 || claimed[0].ID != first.ID {
 		t.Fatalf("not one FIFO claim: %+v", claimed)
 	}
-	task := claimed[0]
-	v, e := s.run("claim_next", Input{QueueID: ptr(q.ID), Actor: task.Assignee})
-	if e != nil || v.(Task).ID != first.ID || v.(Task).Revision != task.Revision {
-		t.Fatal("retry did not recover existing claim")
+	r := claimed[0]
+	v, e := s.run("claim_next", Input{QueueID: ptr(q.ID), Actor: r.ClaimedBy})
+	if e != nil || v.(Request).Revision != r.Revision {
+		t.Fatal("retry changed claim")
 	}
-	if _, e = s.run("claim_task", Input{ID: second.ID, Actor: "other", Revision: 1}); e == nil {
-		t.Fatal("manual claim bypassed queue limit")
+	if len(s.tasks) != 0 {
+		t.Fatal("requests appeared as tickets")
 	}
-	if _, e = s.runAs("update_task", Input{ID: second.ID, Actor: "admin", Revision: 1, Assignee: ptr("other"), Status: ptr("in_progress")}, true); e == nil {
-		t.Fatal("admin bypassed queue limit")
+	if _, e = s.run("complete_request", Input{QueueID: ptr(q.ID), ID: r.ID, Actor: "other", Revision: r.Revision}); e == nil {
+		t.Fatal("non-owner completed")
 	}
-	if _, e = s.run("update_task", Input{ID: task.ID, Actor: task.Assignee, Revision: task.Revision, Status: ptr("done")}); e != nil {
+	if _, e = s.runAs("complete_request", Input{QueueID: ptr(q.ID), ID: r.ID, Actor: "admin", Revision: 1}, true); e == nil {
+		t.Fatal("admin bypassed revision")
+	}
+	if _, e = s.run("complete_request", Input{QueueID: ptr(q.ID), ID: r.ID, Actor: r.ClaimedBy, Revision: r.Revision, Result: json.RawMessage(`{"sha":"abc"}`)}); e != nil {
 		t.Fatal(e)
 	}
 	v, e = s.run("claim_next", Input{QueueID: ptr(q.ID), Actor: "next"})
-	if e != nil || v.(Task).ID != second.ID {
+	if e != nil || v.(Request).ID != second.ID {
 		t.Fatal("next FIFO claim failed")
 	}
 }
@@ -167,8 +174,8 @@ func TestLegacyMigrationAndRestart(t *testing.T) {
 	}
 	var state State
 	b, _ := os.ReadFile(s.path)
-	if e = json.Unmarshal(b, &state); e != nil || state.Version != 2 {
-		t.Fatal("v2 not persisted")
+	if e = json.Unmarshal(b, &state); e != nil || state.Version != 3 {
+		t.Fatal("v3 not persisted")
 	}
 }
 func TestMetadataSaveFailureDoesNotMutate(t *testing.T) {
@@ -187,26 +194,27 @@ func TestMetadataSaveFailureDoesNotMutate(t *testing.T) {
 		t.Fatal("failed queue leaked into memory")
 	}
 }
-func TestQueueReleaseGoesToTailAndBlockedDoesNotRun(t *testing.T) {
+func TestQueueReleaseAndFailure(t *testing.T) {
 	s := testStore(t)
 	q := queue(t, s, "default", 1)
 	a := queued(t, s, "default", q.ID)
 	b := queued(t, s, "default", q.ID)
 	v, _ := s.run("claim_next", Input{QueueID: ptr(q.ID), Actor: "w"})
-	task := v.(Task)
-	if task.ID != a.ID {
-		t.Fatal("FIFO")
+	r := v.(Request)
+	if _, e := s.run("release_request", Input{QueueID: ptr(q.ID), ID: r.ID, Actor: "w", Revision: r.Revision}); e != nil {
+		t.Fatal(e)
 	}
-	s.run("release_task", Input{ID: task.ID, Actor: "w", Revision: task.Revision})
 	v, e := s.run("claim_next", Input{QueueID: ptr(q.ID), Actor: "w"})
-	if e != nil || v.(Task).ID != b.ID {
-		t.Fatal("released ticket did not move to tail")
+	if e != nil || v.(Request).ID != b.ID {
+		t.Fatal("release did not move to tail")
 	}
-	task = v.(Task)
-	s.run("update_task", Input{ID: task.ID, Actor: "w", Revision: task.Revision, Status: ptr("blocked")})
+	r = v.(Request)
+	if _, e = s.run("fail_request", Input{QueueID: ptr(q.ID), ID: r.ID, Actor: "w", Revision: r.Revision, Text: "Checks failed"}); e != nil {
+		t.Fatal(e)
+	}
 	v, e = s.run("claim_next", Input{QueueID: ptr(q.ID), Actor: "w"})
-	if e != nil || v.(Task).ID != a.ID {
-		t.Fatal("blocked ticket selected")
+	if e != nil || v.(Request).ID != a.ID {
+		t.Fatal("failed request selected")
 	}
 }
 func TestAdminAuthenticationRESTAndMCP(t *testing.T) {
@@ -257,13 +265,13 @@ func TestQueueFIFOWithVariableTimestampPrecision(t *testing.T) {
 	q := queue(t, s, "default", 1)
 	first := queued(t, s, "default", q.ID)
 	queued(t, s, "default", q.ID)
-	s.tasks[0].EnqueuedAt = "2026-11-04T12:00:00.1Z"
-	s.tasks[1].EnqueuedAt = "2026-11-04T12:00:00.11Z"
+	s.requests[0].EnqueuedAt = "2026-11-04T12:00:00.1Z"
+	s.requests[1].EnqueuedAt = "2026-11-04T12:00:00.11Z"
 	v, err := s.run("claim_next", Input{QueueID: ptr(q.ID), Actor: "worker"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v.(Task).ID != first.ID {
+	if v.(Request).ID != first.ID {
 		t.Fatal("FIFO used timestamp text instead of chronological order")
 	}
 }
